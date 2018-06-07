@@ -92,7 +92,7 @@ namespace {
     std::string collection;
     std::string attribute;
     std::string search;
-    AstNode* limit;
+    std::uint64_t limit;
 
     fulltextParams(AstNode const* node){
       TRI_ASSERT(node->type == AstNodeType::NODE_TYPE_FCALL);
@@ -102,9 +102,9 @@ namespace {
       attribute = arr->getMember(1)->getString();
       search = arr->getMember(2)->getString();
       if(arr->numMembers() > 3){
-        limit = arr->getMember(3);
+        limit = arr->getMember(3)->getIntValue();
       } else {
-        limit = nullptr;
+        limit = 0;
       }
     }
   };
@@ -127,15 +127,6 @@ namespace {
 
     LOG_DEVEL << fun->name;
     nearParams params(funAstNode);
-
-    // get logical
-    // find out if index is available
-
-    // replace calculation node (add subquery)
-    //    Do this for all instnaces of NEAR, WITHIN, FULLTEXT in calculation.
-    // create subquery (with index node - limit node - add distance name to result)
-    // delete function call form calculation node
-
     LOG_DEVEL << "collection: " << params.collection;
 
     return nullptr;
@@ -162,17 +153,22 @@ namespace {
     auto ast = plan->getAst();
 
     //// create subquery plan for fulltext
+    //
+    //    singleton
+    //        |
+    //      index
+    //        |
+    //     [limit]
+    //        |
+    //      return
 
 
-    ExecutionNode* eSingleton = plan->registerNode(
-        new SingletonNode(plan, plan->nextId())
-    );
+    /// index
+    //  we create this first as creation of this node is more
+    //  likely to fail than the creation of other nodes
 
+    //  index - part 1 - figure out index to use
     auto* trx = ast->query()->trx();
-    auto& vocbase = trx->vocbase();
-    auto aqlCollection = ast->query()->collections()->get(params.collection);
-		auto condition = std::make_unique<Condition>(funAstNode->getMember(0));
-
     std::shared_ptr<arangodb::Index> index = nullptr;
 		try {
 			std::vector<basics::AttributeName> field;
@@ -180,46 +176,73 @@ namespace {
 			auto indexes = trx->indexesForCollection(params.collection);
 			for(auto& idx : indexes){
 				if(idx->type() == arangodb::Index::IndexType::TRI_IDX_TYPE_FULLTEXT_INDEX) {
-					if(basics::AttributeName::isIdentical(idx->fields()[0], field, false)){
+					if(basics::AttributeName::isIdentical(idx->fields()[0], field, false /*ignore expansion in last?!*/)) {
 						index = idx;
 						break;
 					}
 				}
 			}
-		} catch (...) { }
+		} catch (std::exception const& e) {
+      LOG_TOPIC(ERR, Logger::AQL) << "Error while looking for collection ("
+                                  << params.collection << "): "
+                                  << e.what();
+    } catch (...){
+      LOG_TOPIC(ERR, Logger::AQL) << "Error while looking for collection ("
+                                  << params.collection << ")";
+    }
 
-		if(!index){
+		if(!index){ // not found or error
 			return nullptr;
 		}
 
-		// get somewhere else
-    Variable* indexInVariable = ast->variables()->createTemporaryVariable();
+    // index part 2 - get remaining vars required for index creation
+    auto& vocbase = trx->vocbase();
+    auto aqlCollection = ast->query()->collections()->get(params.collection);
+    // TODO - CHECKME - Is this correct or do we need to build our own condition AST
+		auto condition = std::make_unique<Condition>(funAstNode->getMember(0));
+		// create a fresh out variable
+    Variable* indexOutVariable = ast->variables()->createTemporaryVariable();
 
-
-    ExecutionNode* eIndex =
+    ExecutionNode* eIndex = plan->registerNode(
       new IndexNode(
         plan,
         plan->nextId(),
         &vocbase,
         aqlCollection,
-        indexInVariable,
+        indexOutVariable,
         std::vector<transaction::Methods::IndexHandle> {
 					transaction::Methods::IndexHandle{index}
         },
         condition.get(),
         IndexIteratorOptions()
-      );
-	  plan->registerNode(eIndex);
-
-
-    Variable* returnInVariable = ast->variables()->createTemporaryVariable(); //FIXME
-    ExecutionNode* eReturn = plan->registerNode(
-        new ReturnNode(plan, plan->nextId(), returnInVariable)
+      )
     );
-    plan->registerNode(eReturn);
-    eReturn->addDependency(eSingleton);
+
+    /// singleton
+    ExecutionNode* eSingleton = plan->registerNode(
+        new SingletonNode(plan, plan->nextId())
+    );
+
+    /// return
+    ExecutionNode* eReturn = plan->registerNode(
+        // link output of index with the return node
+        new ReturnNode(plan, plan->nextId(), indexOutVariable)
+    );
+
+    /// link nodes together
+    if(!params.limit) {
+      eReturn->addDependency(eIndex);
+    } else {
+      ExecutionNode* eLimit = plan->registerNode(
+        new LimitNode(plan, plan->nextId(), 0 /*offset*/, params.limit)
+      );
+      eReturn->addDependency(eLimit);
+      eLimit->addDependency(eIndex);
+    }
+    eIndex->addDependency(eSingleton);
 
 
+    /// create subquery
     Variable* subqueryOutVariable = ast->variables()->createTemporaryVariable();
     plan->registerSubquery(
         new SubqueryNode(plan, plan->nextId(), eReturn, subqueryOutVariable)
